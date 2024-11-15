@@ -1,0 +1,162 @@
+import pandas as pd
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.decomposition import PCA
+import pennylane.numpy as np
+import pennylane as qml
+import matplotlib.pyplot as plt
+from sklearn.metrics import precision_score, recall_score, f1_score
+
+# Load the dataset
+df = pd.read_csv('task-3-dataset.csv', header=0, quotechar='"', skipinitialspace=True, encoding='utf-8')
+
+# Extract text and labels
+texts = df['отзывы'].values
+labels = df['разметка'].values
+labels = [1 if label == '+' else 0 for label in labels]
+# Bag-of-Words Embedding
+vectorizer = CountVectorizer()
+X = vectorizer.fit_transform(texts).toarray()
+
+# Apply PCA to reduce dimensionality to 1D
+n_qubits = 4
+pca = PCA(n_components=n_qubits)
+X_pca = pca.fit_transform(X)
+
+
+# Haar Wavelet Transform Function
+def haar_wavelet_transform(data):
+    n = len(data)
+    if n == 1:
+        return data
+
+    # Ensure the length of the data is even
+    if n % 2 != 0:
+        data = np.pad(data, (0, 1), mode='constant')
+        n += 1
+
+    # Split the data into even and odd indexed elements
+    even = data[::2]
+    odd = data[1::2]
+
+    # Compute approximation and detail coefficients
+    approx = (even + odd) / 2
+    detail = (even - odd) / 2
+
+    # Recursively apply the transform to the approximation coefficients
+    if len(approx) > 1:
+        approx = haar_wavelet_transform(approx)
+
+    return np.concatenate((approx, detail))
+
+
+# Apply Haar Wavelet Transform to each row in X_pca
+X_haar = np.array([haar_wavelet_transform(row) for row in X_pca])
+
+# Normalize the data
+X_wavelet = (X_haar - X_haar.mean()) / X_haar.std()
+# Define the number of qubits
+print(X_wavelet.shape)
+
+# Create a device
+dev = qml.device("default.qubit", wires=n_qubits)
+
+
+# Define the variational quantum circuit
+def final_layer(wires, weights):
+    qml.RY(weights[0], wires=wires[0])
+    qml.RY(weights[1], wires=wires[1])
+    qml.CNOT(wires=[wires[0], wires[1]])
+    qml.RY(weights[2], wires=wires[0])
+    qml.RY(weights[3], wires=wires[1])
+    qml.CNOT(wires=[wires[1], wires[0]])
+
+
+def ZZFeatureMap(inputs, wires):
+    for i in range(len(wires)):
+        qml.Hadamard(wires=wires[i])
+        qml.RZ(2 * inputs[i], wires=wires[i])
+
+    for i in range(len(wires)):
+        for j in range(i + 1, len(wires)):
+            qml.CZ(wires=[wires[i], wires[j]])
+            qml.RZ(2 * inputs[i] * inputs[j], wires=wires[j])
+            qml.CZ(wires=[wires[i], wires[j]])
+
+
+@qml.qnode(dev)
+def qnode(inputs, weights):  # weights_1_layer, weights_2_layer):
+    # print(inputs)
+    qml.AngleEmbedding(inputs, wires=range(n_qubits))
+    # ZZFeatureMap(inputs=inputs, wires=range(n_qubits))
+    # qml.StronglyEntanglingLayers(weights=weights_1_layer, wires=range(n_qubits))
+    qml.StronglyEntanglingLayers(weights=weights, wires=range(n_qubits))
+    # qml.layer(final_layer, depth=1, wires=[2, 3], weights=weights_2_layer)
+    return [qml.expval(qml.PauliZ(wires=n_qubits - 1))]
+
+
+num_layers = 12
+weight_shapes = {
+    "weights": (num_layers, n_qubits, 3)
+}
+
+# Initialize the parameters
+np.random.seed(42)
+
+
+# Define the loss function
+def loss(params):
+    predictions = [qnode(x, params) for x in X_wavelet]  # , params[1]
+    predictions = np.array(predictions)
+    # predictions_acc = (predictions > 0).astype(int)
+    # accuracy = np.mean(predictions == labels)
+    loss_value = np.mean((predictions - labels) ** 2)
+    return loss_value
+
+
+# Define the optimizer
+opt = qml.MomentumOptimizer(stepsize=0.01, momentum=0.9)
+
+# Training loop
+epochs = 50
+loss_history = []
+params = np.random.uniform(-np.pi, np.pi, weight_shapes["weights"], requires_grad=True)
+# grad_fn = qml.grad(loss)
+# gradients = grad_fn(params)
+# print("Gradients:", gradients)
+
+for epoch in range(epochs):
+    params, _ = opt.step_and_cost(loss, params)  # params
+    current_loss = loss(params)
+    loss_history.append(current_loss)
+
+    print(f"Epoch {epoch + 1}/{epochs}, Loss: {current_loss:.4f}")
+
+np.save('trained_params.npy', params)
+def accuracy(params):
+    predictions = [qnode(x, params) for x in X_wavelet]  # , params[1]
+    predictions = np.array(predictions)
+    predictions = (predictions > 0).astype(int)
+    f1 = f1_score(labels, predictions)
+    return np.mean(predictions == labels), f1
+
+
+test_accuracy, f1 = accuracy(params)
+print(f"Test Accuracy: {test_accuracy:.4f}, F1 Score: {f1:.2f}")
+
+# Plot the loss graph
+plt.plot(loss_history)
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training Loss')
+plt.savefig('training.png')
+plt.savefig('training.pdf')
+
+# # Define a function to generate the QASM code
+# def generate_qasm(params, x):
+#     with qml.QueuingManager.stop_recording():
+#         qnode.construct([x, params, {}])
+#     tape = qnode.qtape
+#     qml.tape.QuantumTape.to_openqasm(tape, filename="trained_model.qasm")
+#
+# # Save the QASM code for a sample input
+# generate_qasm(params, X_wavelet[0])
